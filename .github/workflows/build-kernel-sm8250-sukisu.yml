@@ -1,28 +1,23 @@
-# ============================================================
-#  OnePlus SM8250 (Kona) Kernel Builder
-#  SukiSU-Ultra + KPM 集成 | Clang 工具链 | AnyKernel3 打包
-#  设备支持：OnePlus 8 / 8 Pro / 8T / 9R
-# ============================================================
-name: Build Kernel · SM8250 · SukiSU-Ultra
+name: Build Kernel - SM8250 - SukiSU-Ultra
 
 on:
   workflow_dispatch:
     inputs:
       sukisu_branch:
-        description: 'SukiSU-Ultra 分支 (main / susfs-main / builtin)'
+        description: 'SukiSU-Ultra branch (main / susfs-main)'
         required: false
         default: 'main'
       enable_kpm:
-        description: '启用 KPM 支持 (内核模块补丁)'
+        description: 'Enable KPM support'
         required: false
         default: 'true'
         type: boolean
       enable_lto:
-        description: 'LTO 优化 (thin / none)'
+        description: 'LTO mode (thin / none)'
         required: false
         default: 'thin'
       upload_release:
-        description: '编译成功后发布 Release'
+        description: 'Publish Release after build'
         required: false
         default: 'true'
         type: boolean
@@ -32,12 +27,10 @@ on:
       - '**.md'
       - 'Documentation/**'
 
-# ── 全局变量 ────────────────────────────────────────────────
 env:
   KERNEL_REPO:      "Evolution-XYZ-Devices/kernel_oneplus_sm8250"
   KERNEL_BRANCH:    "udc"
   ARCH:             "arm64"
-  # SM8250 (Kona) defconfig 路径
   DEFCONFIG:        "vendor/kona-perf_defconfig"
   OUT_DIR:          "out"
   KERNEL_VERSION:   "4.19"
@@ -46,285 +39,119 @@ env:
 
 jobs:
   build:
-    name: 🔨 Build SM8250 Kernel
+    name: Build SM8250 Kernel
     runs-on: ubuntu-22.04
     permissions:
       contents: write
 
     steps:
-      # ── 1. 安装依赖 ──────────────────────────────────────
-      - name: 📦 安装编译依赖
+      - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y \
-            git curl wget zip unzip \
-            bc bison flex libssl-dev libelf-dev \
-            python3 python3-pip \
-            make gcc g++ \
-            gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi \
-            binutils-aarch64-linux-gnu \
-            libncurses-dev \
-            cpio device-tree-compiler \
-            lld llvm
+          sudo apt-get install -y git curl wget zip unzip bc bison flex libssl-dev libelf-dev python3 make gcc g++ gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu libncurses-dev cpio device-tree-compiler lld llvm
 
-      # ── 2. 克隆内核源码 ──────────────────────────────────
-      - name: 🐧 克隆内核源码
+      - name: Clone kernel source
         run: |
-          git clone \
-            --depth=1 \
-            --branch ${{ env.KERNEL_BRANCH }} \
-            https://github.com/${{ env.KERNEL_REPO }}.git \
-            kernel_src
-
+          git clone --depth=1 --branch ${{ env.KERNEL_BRANCH }} https://github.com/${{ env.KERNEL_REPO }}.git kernel_src
           cd kernel_src
           echo "KERNEL_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          echo "KERNEL_DATE=$(date '+%Y%m%d-%H%M')"         >> $GITHUB_ENV
-          echo "✅ 内核克隆完成，最新提交: $(git log --oneline -1)"
+          echo "KERNEL_DATE=$(date '+%Y%m%d-%H%M')" >> $GITHUB_ENV
 
-      # ── 3. 下载 Clang 工具链（含 ld.lld 修复） ──────────
-      - name: 🔧 下载 Clang 工具链
+      - name: Download Clang toolchain
         run: |
           mkdir -p toolchain/clang
-
-          wget -q --show-progress \
-            "https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240704-release/Clang-19.0.0git-20240704.tar.gz" \
-            -O clang.tar.gz
+          wget -q --show-progress "https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240704-release/Clang-19.0.0git-20240704.tar.gz" -O clang.tar.gz
           tar -xzf clang.tar.gz -C toolchain/clang --strip-components=1
           rm clang.tar.gz
-
           CLANG_BIN="$(pwd)/toolchain/clang/bin"
-
-          # ── 修复：补全工具链中缺失的 LLVM 工具（优先使用自带的，失败则用系统 lld）
           for tool in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
             if [ ! -f "$CLANG_BIN/$tool" ]; then
-              # 优先从系统查找，但需要确保 ld.lld 是真正的 LLD
               SYS=$(which $tool 2>/dev/null || true)
-              if [ -n "$SYS" ]; then
-                # 对 ld.lld 做额外检查：必须是 LLD 而非 GNU ld
-                if [ "$tool" = "ld.lld" ] && ! $SYS --version 2>/dev/null | grep -qi "LLD"; then
-                  echo "  ⚠️  系统的 $SYS 不是 LLD，跳过软链接"
-                  continue
-                fi
-                ln -sf "$SYS" "$CLANG_BIN/$tool"
-                echo "  🔗 软链接: $tool → $SYS"
-              else
-                echo "  ⚠️  系统中也未找到 $tool"
-              fi
+              [ -n "$SYS" ] && ln -sf "$SYS" "$CLANG_BIN/$tool"
             fi
           done
-
           echo "$CLANG_BIN" >> $GITHUB_PATH
           echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
 
-          echo "✅ Clang:  $($CLANG_BIN/clang   --version | head -1)"
-          echo "✅ ld.lld: $($CLANG_BIN/ld.lld  --version | head -1)"
-
-      # ── 4. 集成 SukiSU-Ultra ─────────────────────────────
-      - name: 🔑 集成 SukiSU-Ultra
+      - name: Integrate SukiSU-Ultra
         working-directory: kernel_src
         run: |
           BRANCH="${{ github.event.inputs.sukisu_branch }}"
           [ -z "$BRANCH" ] && BRANCH="main"
-
-          echo "▶ 正在集成 SukiSU-Ultra (分支: $BRANCH)..."
-          curl -LSs \
-            "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
-            | bash -s "$BRANCH"
-
-          SUKI_VER=$(cat KernelSU/kernel/Makefile 2>/dev/null \
-            | grep "^KERNELSU_VERSION" | awk '{print $3}' || echo "unknown")
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "$BRANCH"
+          SUKI_VER=$(grep "^KERNELSU_VERSION" KernelSU/kernel/Makefile 2>/dev/null | awk '{print $3}' || echo "unknown")
           echo "SUKI_VERSION=$SUKI_VER" >> $GITHUB_ENV
-          echo "✅ SukiSU-Ultra 版本: $SUKI_VER"
 
-      # ── 4.5 修复 KPM access_ok 兼容性（Linux 4.19）────────
-      # 原因：KPM 使用 5.0+ 的 2参数 access_ok(addr, size)
-      #       但 4.19 需要 3参数 access_ok(type, addr, size)
-      - name: 🩹 修复 KPM access_ok 兼容性
+      - name: Patch KPM access_ok for Linux 4.19
         working-directory: kernel_src
         run: |
-          KPM_C="KernelSU/kernel/kpm/kpm.c"
-
+          # Bug 1 修复：setup.sh 将文件集成到 drivers/kernelsu/，而非 KernelSU/kernel/
+          KPM_C="drivers/kernelsu/kpm/kpm.c"
           if [ ! -f "$KPM_C" ]; then
-            echo "⚠️  未找到 $KPM_C，跳过兼容性修复"
+            echo "kpm.c not found at $KPM_C, skipping patch"
             exit 0
           fi
 
-          # 直接从 Makefile 读取内核版本，避免依赖 bash 环境
-          KERNEL_MAJOR=$(sed -n 's/^VERSION = \([0-9]*\)/\1/p' Makefile)
-          KERNEL_MINOR=$(sed -n 's/^PATCHLEVEL = \([0-9]*\)/\1/p' Makefile)
-          echo "▶ 检测到内核版本: ${KERNEL_MAJOR}.${KERNEL_MINOR}"
-
+          KERNEL_MAJOR=$(make kernelversion 2>/dev/null | cut -d. -f1 || echo "4")
           if [ "$KERNEL_MAJOR" -lt 5 ]; then
-            echo "▶ 应用 access_ok 兼容补丁（4.19 → 三参数写法）"
-
-            # 使用 $'...' 确保 \n 被解释为换行
-            COMPAT_MACRO=$'#include <linux/version.h>\n\
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)\n\
-/* 将两参数 access_ok(addr, size) 转换为三参数 */\n\
-#undef access_ok\n\
-#define access_ok(addr, size) \\\n\
-    (access_ok(VERIFY_READ, (unsigned long)(addr), (size)) && \\\n\
-     access_ok(VERIFY_WRITE, (unsigned long)(addr), (size)))\n\
-#endif\n'
-
-            # 在第一个 #include 之前插入宏（若已存在类似注入则避免重复）
-            if ! grep -q "SukiSUUltra_access_ok_fix" "$KPM_C"; then
-              # 添加一个标记，防止重复插入
-              sed -i "1s|^|${COMPAT_MACRO}\n/* SukiSUUltra_access_ok_fix */\n|" "$KPM_C"
-              echo "✅ access_ok 兼容补丁已应用"
-            else
-              echo "✅ access_ok 兼容补丁已存在，跳过"
-            fi
-          else
-            echo "✅ 内核 >= 5.0，无需兼容补丁"
+            # Bug 2 修复：arm64 4.19 底层函数是 __range_ok，不是 __access_ok
+            # Bug 3 修复：通过 sed 插在 #include <linux/uaccess.h> 之后，
+            #            避免后续 include 将我们的定义覆盖
+            sed -i 's|#include <linux/uaccess.h>|#include <linux/uaccess.h>\n#include <linux/version.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)\n#undef  access_ok\n#define access_ok(addr, size) __range_ok(addr, size)\n#endif|' "$KPM_C"
+            echo "Patch applied successfully"
+            grep -A6 "uaccess.h" "$KPM_C" | head -10
           fi
 
-      # ── 5. 修改 defconfig ────────────────────────────────
-      - name: ⚙️ 修改 defconfig
+      - name: Modify defconfig
         working-directory: kernel_src
         run: |
-          # 确定实际使用的 defconfig 路径
-          DEFCONFIG_PATH="arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG }}"
-          if [ ! -f "$DEFCONFIG_PATH" ]; then
-            echo "⚠️  未找到 $DEFCONFIG_PATH，尝试 kona_defconfig"
-            DEFCONFIG_PATH="arch/${{ env.ARCH }}/configs/kona_defconfig"
-          fi
-          echo "ACTUAL_DEFCONFIG=$DEFCONFIG_PATH" >> $GITHUB_ENV
+          DEFCONFIG_FILE="arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG }}"
+          [ ! -f "$DEFCONFIG_FILE" ] && DEFCONFIG_FILE="arch/${{ env.ARCH }}/configs/kona_defconfig"
+          echo "ACTUAL_DEFCONFIG=$DEFCONFIG_FILE" >> $GITHUB_ENV
+          printf '\nCONFIG_KSU=y\nCONFIG_KPROBES=y\nCONFIG_HAVE_KPROBES=y\nCONFIG_KPROBE_EVENTS=y\nCONFIG_KALLSYMS=y\nCONFIG_KALLSYMS_ALL=y\nCONFIG_MODULES=y\nCONFIG_MODULE_UNLOAD=y\n' >> "$DEFCONFIG_FILE"
+          [ "${{ github.event.inputs.enable_kpm }}" = "true" ] && echo "CONFIG_KPM=y" >> "$DEFCONFIG_FILE"
+          tail -12 "$DEFCONFIG_FILE"
 
-          cat >> "$DEFCONFIG_PATH" << 'EOCONF'
-
-          # ── SukiSU-Ultra ────────────────────────────────
-          CONFIG_KSU=y
-
-          # kprobe Hook（非 GKI 必须）
-          CONFIG_KPROBES=y
-          CONFIG_HAVE_KPROBES=y
-          CONFIG_KPROBE_EVENTS=y
-
-          # KALLSYMS（KPM 必须）
-          CONFIG_KALLSYMS=y
-          CONFIG_KALLSYMS_ALL=y
-
-          # 模块支持
-          CONFIG_MODULES=y
-          CONFIG_MODULE_UNLOAD=y
-          EOCONF
-
-          # 处理 KPM 选项：对于 workflow_dispatch 使用输入值；对于 push 默认启用
-          ENABLE_KPM="${{ github.event.inputs.enable_kpm }}"
-          if [ -z "$ENABLE_KPM" ]; then
-            # push 事件时没有 inputs，默认开启 KPM
-            ENABLE_KPM="true"
-          fi
-          if [ "$ENABLE_KPM" = "true" ]; then
-            echo "CONFIG_KPM=y" >> "$DEFCONFIG_PATH"
-            echo "✅ KPM 支持已启用"
-          fi
-
-          echo "✅ defconfig 修改完成 ($DEFCONFIG_PATH)"
-          echo "── 末尾 20 行 ──"
-          tail -20 "$DEFCONFIG_PATH"
-
-      # ── 6. 设置 LTO 模式 ────────────────────────────────
-      - name: 🌍 设置编译参数
+      - name: Set LTO mode
         run: |
           LTO="${{ github.event.inputs.enable_lto }}"
           [ -z "$LTO" ] && LTO="thin"
           echo "LTO_FLAG=LTO=$LTO" >> $GITHUB_ENV
-          echo "✅ LTO 模式: $LTO"
 
-      # ── 7. 生成 .config ──────────────────────────────────
-      - name: 📋 生成 .config
+      - name: Generate .config
         working-directory: kernel_src
         run: |
-          # 提取相对于 arch/arm64/configs 的路径
-          DEFCONFIG_REL="${ACTUAL_DEFCONFIG#arch/arm64/configs/}"
-          echo "▶ 使用 defconfig: $DEFCONFIG_REL"
+          DEFCONFIG_NAME=$(echo "${{ env.ACTUAL_DEFCONFIG }}" | sed 's|arch/arm64/configs/||')
+          make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- LD="${{ env.CLANG_BIN }}/ld.lld" AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip "$DEFCONFIG_NAME"
 
-          make O=${{ env.OUT_DIR }} \
-            ARCH=${{ env.ARCH }} \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            LD="${{ env.CLANG_BIN }}/ld.lld" \
-            AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            "$DEFCONFIG_REL"
-
-          echo "✅ .config 生成完成"
-
-      # ── 8. 编译内核 ──────────────────────────────────────
-      - name: 🔨 编译内核
+      - name: Build kernel
         working-directory: kernel_src
         run: |
           START=$(date +%s)
-          echo "▶ 编译线程: $(nproc --all)"
-
-          make O=${{ env.OUT_DIR }} \
-            ARCH=${{ env.ARCH }} \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            LD="${{ env.CLANG_BIN }}/ld.lld" \
-            AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            ${{ env.LTO_FLAG }} \
-            -j$(nproc --all) 2>&1 | tee ../build.log
-
+          make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- LD="${{ env.CLANG_BIN }}/ld.lld" AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip ${{ env.LTO_FLAG }} -j$(nproc --all) 2>&1 | tee ../build.log
           END=$(date +%s)
-          MINS=$(( (END - START) / 60 ))
-          echo "BUILD_MINS=${MINS}min" >> $GITHUB_ENV
-
-          IMAGE="${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image"
-          if [ -f "$IMAGE" ]; then
-            echo "✅ 编译成功！耗时 ${MINS} 分钟"
+          echo "BUILD_MINS=$(( (END-START)/60 ))min" >> $GITHUB_ENV
+          if [ -f "${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image" ]; then
             echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
           else
-            echo "❌ 编译失败，请下载 build.log 排查"
-            echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
-            exit 1
+            echo "BUILD_SUCCESS=false" >> $GITHUB_ENV; exit 1
           fi
 
-      # ── 9. AnyKernel3 打包 ───────────────────────────────
-      - name: 📦 打包 AnyKernel3
+      - name: Package with AnyKernel3
         if: env.BUILD_SUCCESS == 'true'
         run: |
-          git clone --depth=1 \
-            https://github.com/${{ env.ANYKERNEL_REPO }}.git \
-            -b ${{ env.ANYKERNEL_BRANCH }} \
-            AnyKernel3
-
-          # 复制所有可能的镜像文件（Image / Image.lz4 / Image.gz）
-          find kernel_src/${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/ \
-            -maxdepth 1 -type f -name "Image*" -exec cp {} AnyKernel3/ \;
-
-          # 复制 dtbo（若存在）
+          git clone --depth=1 https://github.com/${{ env.ANYKERNEL_REPO }}.git -b ${{ env.ANYKERNEL_BRANCH }} AnyKernel3
+          cp kernel_src/${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image AnyKernel3/
           DTBO="kernel_src/${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/dtbo.img"
-          [ -f "$DTBO" ] && cp "$DTBO" AnyKernel3/ && echo "✅ dtbo.img 已复制"
-
-          # 生成包名
-          KPM_TAG=""
-          ENABLE_KPM="${{ github.event.inputs.enable_kpm }}"
-          if [ -z "$ENABLE_KPM" ]; then ENABLE_KPM="true"; fi
-          if [ "$ENABLE_KPM" = "true" ]; then KPM_TAG="-KPM"; fi
+          [ -f "$DTBO" ] && cp "$DTBO" AnyKernel3/
+          KPM_TAG=""; [ "${{ github.event.inputs.enable_kpm }}" = "true" ] && KPM_TAG="-KPM"
           ZIP="Kernel-SM8250-SukiSU_v${{ env.SUKI_VERSION }}${KPM_TAG}-${{ env.KERNEL_DATE }}-${{ env.KERNEL_COMMIT }}.zip"
           echo "ZIP_NAME=$ZIP" >> $GITHUB_ENV
+          cd AnyKernel3 && zip -r9 "../$ZIP" . -x ".git*" -x "*.md" -x "LICENSE" && cd ..
+          echo "ZIP_SHA256=$(sha256sum "$ZIP" | awk '{print $1}')" >> $GITHUB_ENV
+          echo "ZIP_SIZE=$(du -sh "$ZIP" | awk '{print $1}')" >> $GITHUB_ENV
 
-          cd AnyKernel3
-          zip -r9 "../$ZIP" . -x ".git*" -x "*.md" -x "LICENSE"
-          cd ..
-
-          SHA256=$(sha256sum "$ZIP" | awk '{print $1}')
-          SIZE=$(du -sh "$ZIP" | awk '{print $1}')
-          echo "ZIP_SHA256=$SHA256" >> $GITHUB_ENV
-          echo "ZIP_SIZE=$SIZE"     >> $GITHUB_ENV
-          echo "✅ 打包完成: $ZIP ($SIZE)"
-
-      # ── 10. 上传 Artifact ────────────────────────────────
-      - name: ⬆️ 上传 Artifact
+      - name: Upload Artifact
         if: env.BUILD_SUCCESS == 'true'
         uses: actions/upload-artifact@v4
         with:
@@ -332,8 +159,7 @@ jobs:
           path: ${{ env.ZIP_NAME }}
           retention-days: 7
 
-      # ── 11. 上传编译日志（无论成败）────────────────────
-      - name: 📄 上传编译日志
+      - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -341,49 +167,26 @@ jobs:
           path: build.log
           retention-days: 3
 
-      # ── 12. 发布 GitHub Release ──────────────────────────
-      - name: 🚀 发布 GitHub Release
-        if: |
-          env.BUILD_SUCCESS == 'true' &&
-          (github.event.inputs.upload_release == 'true' || github.event_name == 'push')
+      - name: Publish GitHub Release
+        if: env.BUILD_SUCCESS == 'true' && (github.event.inputs.upload_release == 'true' || github.event_name == 'push')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "SukiSU-${{ env.SUKI_VERSION }}-${{ env.KERNEL_DATE }}"
-          name: "🐧 SM8250 Kernel | SukiSU-Ultra v${{ env.SUKI_VERSION }} | ${{ env.KERNEL_DATE }}"
+          name: "SM8250 Kernel | SukiSU-Ultra v${{ env.SUKI_VERSION }} | ${{ env.KERNEL_DATE }}"
           body: |
-            ## 📱 OnePlus 8 / 8 Pro / 8T / 9R — Custom Kernel
+            ## OnePlus 8 / 8 Pro / 8T / 9R - Custom Kernel
+            **SukiSU-Ultra** v${{ env.SUKI_VERSION }} | Branch: `${{ github.event.inputs.sukisu_branch || 'main' }}`
+            **KPM**: `${{ github.event.inputs.enable_kpm || 'true' }}` | **LTO**: `${{ github.event.inputs.enable_lto || 'thin' }}`
+            **Commit**: `${{ env.KERNEL_COMMIT }}` | **Date**: ${{ env.KERNEL_DATE }} | **Time**: ${{ env.BUILD_MINS }}
 
-            ### ✨ 特性
-            - **SukiSU-Ultra** v${{ env.SUKI_VERSION }} 已集成（分支: `${{ github.event.inputs.sukisu_branch || 'main' }}`）
-            - **KPM (Kernel Patch Module)** 支持：`${{ github.event.inputs.enable_kpm || 'true' }}`
-            - 基于 Evolution-XYZ 内核源码（`udc` 分支）
-            - Clang 编译 + LTO `${{ github.event.inputs.enable_lto || 'thin' }}`
-            - kprobe 自动 Hook | KALLSYMS 完整符号表
+            | Item | Value |
+            |------|-------|
+            | Platform | Snapdragon 865 (SM8250) |
+            | Kernel | Linux ${{ env.KERNEL_VERSION }} |
+            | Size | ${{ env.ZIP_SIZE }} |
+            | SHA256 | `${{ env.ZIP_SHA256 }}` |
 
-            ### 📋 构建信息
-            | 项目 | 内容 |
-            |------|------|
-            | 芯片平台 | Snapdragon 865 (SM8250 / Kona) |
-            | 内核版本 | Linux ${{ env.KERNEL_VERSION }} |
-            | 提交 SHA | `${{ env.KERNEL_COMMIT }}` |
-            | 构建时间 | ${{ env.KERNEL_DATE }} |
-            | 编译耗时 | ${{ env.BUILD_MINS }} |
-            | 包体积   | ${{ env.ZIP_SIZE }} |
-
-            ### 🔒 SHA256 校验
-            ```
-            ${{ env.ZIP_SHA256 }}
-            ```
-
-            ### 📖 刷入步骤
-            1. 解锁 Bootloader
-            2. 进入 Recovery（TWRP / OrangeFox）
-            3. 刷入此 zip
-            4. 安装 [SukiSU-Ultra Manager APK](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
-            5. 重启，享用 Root 🎉
-
-            ### ⚠️ 免责声明
-            > 本内核仅供学习研究使用。刷机有风险，操作前请备份数据。
+            **How to install:** Unlock BL -> Flash in Recovery -> Install SukiSU Manager APK -> Reboot
           files: ${{ env.ZIP_NAME }}
           draft: false
           prerelease: false
