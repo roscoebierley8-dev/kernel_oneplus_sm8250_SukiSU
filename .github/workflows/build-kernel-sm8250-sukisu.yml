@@ -66,7 +66,7 @@ jobs:
             binutils-aarch64-linux-gnu \
             libncurses-dev \
             cpio device-tree-compiler \
-            lld llvm        # 系统级 ld.lld 备用，防止工具链缺失
+            lld llvm
 
       # ── 2. 克隆内核源码 ──────────────────────────────────
       - name: 🐧 克隆内核源码
@@ -87,7 +87,6 @@ jobs:
         run: |
           mkdir -p toolchain/clang
 
-          # ZyC Clang 19 — 针对 Android 内核优化
           wget -q --show-progress \
             "https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240704-release/Clang-19.0.0git-20240704.tar.gz" \
             -O clang.tar.gz
@@ -96,11 +95,17 @@ jobs:
 
           CLANG_BIN="$(pwd)/toolchain/clang/bin"
 
-          # ── 修复：补全工具链中缺失的 LLVM 工具 ──────────
+          # ── 修复：补全工具链中缺失的 LLVM 工具（优先使用自带的，失败则用系统 lld）
           for tool in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
             if [ ! -f "$CLANG_BIN/$tool" ]; then
+              # 优先从系统查找，但需要确保 ld.lld 是真正的 LLD
               SYS=$(which $tool 2>/dev/null || true)
               if [ -n "$SYS" ]; then
+                # 对 ld.lld 做额外检查：必须是 LLD 而非 GNU ld
+                if [ "$tool" = "ld.lld" ] && ! $SYS --version 2>/dev/null | grep -qi "LLD"; then
+                  echo "  ⚠️  系统的 $SYS 不是 LLD，跳过软链接"
+                  continue
+                fi
                 ln -sf "$SYS" "$CLANG_BIN/$tool"
                 echo "  🔗 软链接: $tool → $SYS"
               else
@@ -109,7 +114,6 @@ jobs:
             fi
           done
 
-          # 写入全局 PATH（对所有后续 step 永久生效）
           echo "$CLANG_BIN" >> $GITHUB_PATH
           echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
 
@@ -128,7 +132,6 @@ jobs:
             "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
             | bash -s "$BRANCH"
 
-          # 获取版本号
           SUKI_VER=$(cat KernelSU/kernel/Makefile 2>/dev/null \
             | grep "^KERNELSU_VERSION" | awk '{print $3}' || echo "unknown")
           echo "SUKI_VERSION=$SUKI_VER" >> $GITHUB_ENV
@@ -147,27 +150,32 @@ jobs:
             exit 0
           fi
 
-          KERNEL_MAJOR=$(make kernelversion 2>/dev/null | cut -d. -f1 || echo "4")
-          KERNEL_MINOR=$(make kernelversion 2>/dev/null | cut -d. -f2 || echo "19")
+          # 直接从 Makefile 读取内核版本，避免依赖 bash 环境
+          KERNEL_MAJOR=$(sed -n 's/^VERSION = \([0-9]*\)/\1/p' Makefile)
+          KERNEL_MINOR=$(sed -n 's/^PATCHLEVEL = \([0-9]*\)/\1/p' Makefile)
           echo "▶ 检测到内核版本: ${KERNEL_MAJOR}.${KERNEL_MINOR}"
 
-          # 仅 5.0 以下的内核需要打补丁
           if [ "$KERNEL_MAJOR" -lt 5 ]; then
-            echo "▶ 应用 access_ok 兼容补丁（4.19 → 3参数写法）"
+            echo "▶ 应用 access_ok 兼容补丁（4.19 → 三参数写法）"
 
-            # 在 kpm.c 文件顶部添加兼容宏，将 2参数调用透明替换为 3参数
-            COMPAT_MACRO='#include <linux/version.h>\n\
+            # 使用 $'...' 确保 \n 被解释为换行
+            COMPAT_MACRO=$'#include <linux/version.h>\n\
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)\n\
-/* access_ok 在 4.19 中需要 3 个参数：access_ok(type, addr, size) */\n\
-#undef  access_ok\n\
+/* 将两参数 access_ok(addr, size) 转换为三参数 */\n\
+#undef access_ok\n\
 #define access_ok(addr, size) \\\n\
-    __access_ok((unsigned long)(addr), (size))\n\
+    (access_ok(VERIFY_READ, (unsigned long)(addr), (size)) && \\\n\
+     access_ok(VERIFY_WRITE, (unsigned long)(addr), (size)))\n\
 #endif\n'
 
-            # 在第一个 #include 行之前插入兼容宏
-            sed -i "1s|^|${COMPAT_MACRO}|" "$KPM_C"
-            echo "✅ access_ok 兼容补丁已应用"
-            head -20 "$KPM_C"
+            # 在第一个 #include 之前插入宏（若已存在类似注入则避免重复）
+            if ! grep -q "SukiSUUltra_access_ok_fix" "$KPM_C"; then
+              # 添加一个标记，防止重复插入
+              sed -i "1s|^|${COMPAT_MACRO}\n/* SukiSUUltra_access_ok_fix */\n|" "$KPM_C"
+              echo "✅ access_ok 兼容补丁已应用"
+            else
+              echo "✅ access_ok 兼容补丁已存在，跳过"
+            fi
           else
             echo "✅ 内核 >= 5.0，无需兼容补丁"
           fi
@@ -176,16 +184,15 @@ jobs:
       - name: ⚙️ 修改 defconfig
         working-directory: kernel_src
         run: |
-          DEFCONFIG_FILE="arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG }}"
-
-          # 若路径不存在，尝试通用路径
-          if [ ! -f "$DEFCONFIG_FILE" ]; then
-            echo "⚠️  未找到 $DEFCONFIG_FILE，尝试 kona_defconfig..."
-            DEFCONFIG_FILE="arch/${{ env.ARCH }}/configs/kona_defconfig"
+          # 确定实际使用的 defconfig 路径
+          DEFCONFIG_PATH="arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG }}"
+          if [ ! -f "$DEFCONFIG_PATH" ]; then
+            echo "⚠️  未找到 $DEFCONFIG_PATH，尝试 kona_defconfig"
+            DEFCONFIG_PATH="arch/${{ env.ARCH }}/configs/kona_defconfig"
           fi
-          echo "ACTUAL_DEFCONFIG=$DEFCONFIG_FILE" >> $GITHUB_ENV
+          echo "ACTUAL_DEFCONFIG=$DEFCONFIG_PATH" >> $GITHUB_ENV
 
-          cat >> "$DEFCONFIG_FILE" << 'EOCONF'
+          cat >> "$DEFCONFIG_PATH" << 'EOCONF'
 
           # ── SukiSU-Ultra ────────────────────────────────
           CONFIG_KSU=y
@@ -204,15 +211,20 @@ jobs:
           CONFIG_MODULE_UNLOAD=y
           EOCONF
 
-          # KPM 支持（可选）
-          if [ "${{ github.event.inputs.enable_kpm }}" = "true" ]; then
-            echo "CONFIG_KPM=y" >> "$DEFCONFIG_FILE"
+          # 处理 KPM 选项：对于 workflow_dispatch 使用输入值；对于 push 默认启用
+          ENABLE_KPM="${{ github.event.inputs.enable_kpm }}"
+          if [ -z "$ENABLE_KPM" ]; then
+            # push 事件时没有 inputs，默认开启 KPM
+            ENABLE_KPM="true"
+          fi
+          if [ "$ENABLE_KPM" = "true" ]; then
+            echo "CONFIG_KPM=y" >> "$DEFCONFIG_PATH"
             echo "✅ KPM 支持已启用"
           fi
 
-          echo "✅ defconfig 修改完成 ($DEFCONFIG_FILE)"
+          echo "✅ defconfig 修改完成 ($DEFCONFIG_PATH)"
           echo "── 末尾 20 行 ──"
-          tail -20 "$DEFCONFIG_FILE"
+          tail -20 "$DEFCONFIG_PATH"
 
       # ── 6. 设置 LTO 模式 ────────────────────────────────
       - name: 🌍 设置编译参数
@@ -226,14 +238,9 @@ jobs:
       - name: 📋 生成 .config
         working-directory: kernel_src
         run: |
-          # 使用实际 defconfig 路径（去掉 arch/arm64/configs/ 前缀交给 make）
-          DEFCONFIG_TARGET=$(basename ${{ env.ACTUAL_DEFCONFIG }})
-          DEFCONFIG_DIR=$(dirname ${{ env.ACTUAL_DEFCONFIG }} | sed 's|arch/arm64/configs/||')
-          # make 需要相对于 arch/arm64/configs/ 的路径
-          MAKE_DEFCONFIG="${DEFCONFIG_DIR}/${DEFCONFIG_TARGET}"
-          MAKE_DEFCONFIG=$(echo "$MAKE_DEFCONFIG" | sed 's|^/||')
-
-          echo "▶ 使用 defconfig: $MAKE_DEFCONFIG"
+          # 提取相对于 arch/arm64/configs 的路径
+          DEFCONFIG_REL="${ACTUAL_DEFCONFIG#arch/arm64/configs/}"
+          echo "▶ 使用 defconfig: $DEFCONFIG_REL"
 
           make O=${{ env.OUT_DIR }} \
             ARCH=${{ env.ARCH }} \
@@ -244,7 +251,7 @@ jobs:
             LD="${{ env.CLANG_BIN }}/ld.lld" \
             AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            "$MAKE_DEFCONFIG"
+            "$DEFCONFIG_REL"
 
           echo "✅ .config 生成完成"
 
@@ -290,8 +297,9 @@ jobs:
             -b ${{ env.ANYKERNEL_BRANCH }} \
             AnyKernel3
 
-          # 复制 Image
-          cp kernel_src/${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image AnyKernel3/
+          # 复制所有可能的镜像文件（Image / Image.lz4 / Image.gz）
+          find kernel_src/${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/ \
+            -maxdepth 1 -type f -name "Image*" -exec cp {} AnyKernel3/ \;
 
           # 复制 dtbo（若存在）
           DTBO="kernel_src/${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/dtbo.img"
@@ -299,7 +307,9 @@ jobs:
 
           # 生成包名
           KPM_TAG=""
-          [ "${{ github.event.inputs.enable_kpm }}" = "true" ] && KPM_TAG="-KPM"
+          ENABLE_KPM="${{ github.event.inputs.enable_kpm }}"
+          if [ -z "$ENABLE_KPM" ]; then ENABLE_KPM="true"; fi
+          if [ "$ENABLE_KPM" = "true" ]; then KPM_TAG="-KPM"; fi
           ZIP="Kernel-SM8250-SukiSU_v${{ env.SUKI_VERSION }}${KPM_TAG}-${{ env.KERNEL_DATE }}-${{ env.KERNEL_COMMIT }}.zip"
           echo "ZIP_NAME=$ZIP" >> $GITHUB_ENV
 
