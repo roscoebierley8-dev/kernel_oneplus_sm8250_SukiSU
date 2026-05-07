@@ -134,6 +134,44 @@ jobs:
           echo "SUKI_VERSION=$SUKI_VER" >> $GITHUB_ENV
           echo "✅ SukiSU-Ultra 版本: $SUKI_VER"
 
+      # ── 4.5 修复 KPM access_ok 兼容性（Linux 4.19）────────
+      # 原因：KPM 使用 5.0+ 的 2参数 access_ok(addr, size)
+      #       但 4.19 需要 3参数 access_ok(type, addr, size)
+      - name: 🩹 修复 KPM access_ok 兼容性
+        working-directory: kernel_src
+        run: |
+          KPM_C="KernelSU/kernel/kpm/kpm.c"
+
+          if [ ! -f "$KPM_C" ]; then
+            echo "⚠️  未找到 $KPM_C，跳过兼容性修复"
+            exit 0
+          fi
+
+          KERNEL_MAJOR=$(make kernelversion 2>/dev/null | cut -d. -f1 || echo "4")
+          KERNEL_MINOR=$(make kernelversion 2>/dev/null | cut -d. -f2 || echo "19")
+          echo "▶ 检测到内核版本: ${KERNEL_MAJOR}.${KERNEL_MINOR}"
+
+          # 仅 5.0 以下的内核需要打补丁
+          if [ "$KERNEL_MAJOR" -lt 5 ]; then
+            echo "▶ 应用 access_ok 兼容补丁（4.19 → 3参数写法）"
+
+            # 在 kpm.c 文件顶部添加兼容宏，将 2参数调用透明替换为 3参数
+            COMPAT_MACRO='#include <linux/version.h>\n\
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)\n\
+/* access_ok 在 4.19 中需要 3 个参数：access_ok(type, addr, size) */\n\
+#undef  access_ok\n\
+#define access_ok(addr, size) \\\n\
+    __access_ok((unsigned long)(addr), (size))\n\
+#endif\n'
+
+            # 在第一个 #include 行之前插入兼容宏
+            sed -i "1s|^|${COMPAT_MACRO}|" "$KPM_C"
+            echo "✅ access_ok 兼容补丁已应用"
+            head -20 "$KPM_C"
+          else
+            echo "✅ 内核 >= 5.0，无需兼容补丁"
+          fi
+
       # ── 5. 修改 defconfig ────────────────────────────────
       - name: ⚙️ 修改 defconfig
         working-directory: kernel_src
