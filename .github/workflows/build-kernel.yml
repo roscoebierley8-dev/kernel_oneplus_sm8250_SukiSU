@@ -9,18 +9,18 @@ on:
         default: "instantnoodle"
         type: choice
         options:
-          - instantnoodle      # OnePlus 8
-          - instantnoodlep     # OnePlus 8 Pro
-          - kebab              # OnePlus 8T
-          - lemonadep          # OnePlus 9R (also lemonade variants)
+          - instantnoodle
+          - instantnoodlep
+          - kebab
+          - lemonadep
       kernel_repo:
-        description: "Kernel source repo (must be EvolutionX/LineageOS 22.2 SM8250 tree)"
+        description: "Kernel source repo URL"
         required: true
-        default: "https://github.com/Evolution-X-Devices/kernel_oneplus_sm8250"
+        default: "https://github.com/LineageOS/android_kernel_oneplus_sm8250"
       kernel_branch:
-        description: "Kernel source branch"
+        description: "Branch (LineageOS: lineage-23.0=A16, lineage-22.2=A15; EvoX-Devices: bka)"
         required: true
-        default: "lineage-22.2"
+        default: "lineage-23.0"
       enable_susfs:
         description: "Enable SUSFS (root hiding)"
         required: true
@@ -34,6 +34,7 @@ on:
 
 env:
   TZ: Asia/Shanghai
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
@@ -67,15 +68,20 @@ jobs:
 
       - name: Clone kernel source
         run: |
-          git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
-            "${{ inputs.kernel_repo }}" kernel
-          cd kernel
+          REPO="${{ inputs.kernel_repo }}"
+          BRANCH="${{ inputs.kernel_branch }}"
+          echo "Cloning $REPO @ $BRANCH"
+          if ! git clone --depth=1 -b "$BRANCH" "$REPO" kernel; then
+            echo "::error::Failed to clone $REPO at branch '$BRANCH'."
+            echo "Available branches on remote:"
+            git ls-remote --heads "$REPO" | awk '{print "  " $2}' | sed 's|refs/heads/||'
+            exit 128
+          fi
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel" >> $GITHUB_ENV
 
       - name: Clone AOSP clang toolchain
         run: |
           mkdir -p toolchain/clang
-          # AOSP clang r487747c — works for 4.19 downstream; pin to a known-good build
           git clone --depth=1 -b master-kernel-build-2023 \
             https://gitlab.com/PixelOS-Devices/playgroundtc.git toolchain/clang || \
           git clone --depth=1 \
@@ -87,7 +93,6 @@ jobs:
         run: |
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
             | bash -s susfs-main
-          # Ensure KSU is included in the build
           if ! grep -q "drivers/kernelsu" drivers/Makefile 2>/dev/null; then
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
@@ -102,16 +107,13 @@ jobs:
           git clone --depth=1 -b kernel-4.19 \
             https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
 
-          # Copy SUSFS sources into kernel tree
           cp ../susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
           cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
 
-          # Apply 4.19 SUSFS patch
           if [ -f ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch ]; then
             patch -p1 --forward --fuzz=3 < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
           fi
 
-          # Apply SukiSU's bundled SUSFS hook patch
           if [ -f ../build/patches/susfs_sukisu_hooks.patch ]; then
             patch -p1 --forward --fuzz=3 < ../build/patches/susfs_sukisu_hooks.patch || true
           fi
@@ -130,7 +132,6 @@ jobs:
         working-directory: kernel
         run: |
           DEVICE="${{ inputs.device }}"
-          # SM8250 OnePlus defconfig naming varies between trees; try common ones
           for cfg in \
             "vendor/${DEVICE}_defconfig" \
             "vendor/kona_defconfig" \
@@ -147,7 +148,6 @@ jobs:
             exit 1
           fi
 
-          # Append our fragment (KSU + SUSFS + Zygisk-friendly options)
           cat ../build/configs/sukisu.config >> "arch/arm64/configs/$DEFCONFIG"
 
           if [ "${{ inputs.enable_lto }}" = "true" ]; then
@@ -198,7 +198,6 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
           cp build/anykernel/anykernel.sh ak3/anykernel.sh
-          # Substitute device codename
           sed -i "s/__DEVICE__/${{ inputs.device }}/g" ak3/anykernel.sh
 
           cp kernel/out/arch/arm64/boot/Image ak3/ 2>/dev/null || true
