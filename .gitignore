@@ -1,7 +1,0 @@
-kernel/
-toolchain/
-susfs4ksu/
-ak3/
-*.zip
-*.log
-out/
