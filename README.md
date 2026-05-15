@@ -20,10 +20,10 @@ GitHub Actions 工作流,为 **OnePlus 8 / 8 Pro / 8T / 9R** (Snapdragon 865 / S
 2. 进入仓库 → **Actions** → **Build SM8250 SukiSU-Ultra Kernel** → **Run workflow**
 3. 选择参数:
    - `device`: 你的机型 codename
-   - `kernel_repo`: 默认是 `Evolution-X-Devices/kernel_oneplus_sm8250`,如果 EvoX 没有为你的机型维护这棵树,可以换成 LineageOS 22.2 的 SM8250 tree(例如 `LineageOS/android_kernel_oneplus_sm8250`)
-   - `kernel_branch`: 默认 `lineage-22.2`(对应 Android 16)
-   - `enable_susfs`: 默认开启,关闭则只有 root 没有隐藏
-   - `enable_lto`: 默认关闭,开启编译更慢但内核稍快
+   - `kernel_repo`: 默认 `LineageOS/android_kernel_oneplus_sm8250`(最稳定)
+   - `kernel_branch`: **默认 `lineage-23.0` = Android 16**(对应 Evolution X 11.x)。其他选项:`lineage-22.2`=A15,`lineage-21`=A14;若用 EvoX-Devices repo 则填 `bka`
+   - `enable_susfs`: 默认开启
+   - `enable_lto`: 默认关闭
 4. 编译完成后到 Run 页面下载 artifact zip
 
 ## 刷入流程
