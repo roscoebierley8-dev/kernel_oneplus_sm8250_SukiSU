@@ -1,1 +1,7 @@
-
+# Drop additional .patch files here. They will be auto-applied (-p1, --forward) after
+# SukiSU + SUSFS integration. Name them with a numeric prefix to control order, e.g.:
+#   10-fix-dtbo-magic.patch
+#   20-extra-hardening.patch
+#
+# A patch named exactly `susfs_sukisu_hooks.patch` is reserved and applied during the
+# SUSFS step (use it only if your kernel tree needs the SukiSU manual-hook patch).
