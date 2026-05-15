@@ -132,27 +132,54 @@ jobs:
         working-directory: kernel
         run: |
           DEVICE="${{ inputs.device }}"
-          for cfg in \
-            "vendor/${DEVICE}_defconfig" \
-            "vendor/kona_defconfig" \
-            "vendor/lineage_${DEVICE}_defconfig"; do
-            if [ -f "arch/arm64/configs/$cfg" ]; then
-              echo "DEFCONFIG=$cfg" >> $GITHUB_ENV
+          CFG_DIR="arch/arm64/configs"
+
+          echo "=== Available defconfigs ==="
+          find "$CFG_DIR" -maxdepth 2 -name "*_defconfig" -o -name "*.config" | sort
+          echo "==========================="
+
+          CANDIDATES=(
+            "vendor/${DEVICE}_defconfig"
+            "vendor/lineage_${DEVICE}_defconfig"
+            "vendor/lineage-${DEVICE}_defconfig"
+            "vendor/kona-perf_defconfig"
+            "vendor/kona_defconfig"
+            "vendor/lineage_kona_defconfig"
+            "vendor/lineageos_${DEVICE}_defconfig"
+          )
+
+          DEFCONFIG=""
+          for cfg in "${CANDIDATES[@]}"; do
+            if [ -f "$CFG_DIR/$cfg" ]; then
+              DEFCONFIG="$cfg"
+              echo "Selected: $DEFCONFIG"
               break
             fi
           done
 
           if [ -z "$DEFCONFIG" ]; then
-            echo "ERROR: no defconfig found for $DEVICE — check the kernel tree"
-            ls arch/arm64/configs/ | head -50
+            echo "::error::no defconfig matched for $DEVICE"
             exit 1
           fi
 
-          cat ../build/configs/sukisu.config >> "arch/arm64/configs/$DEFCONFIG"
+          MERGE_FRAGS=""
+          for frag in \
+              "$CFG_DIR/vendor/oplus.config" \
+              "$CFG_DIR/vendor/debugfs.config" \
+              "$CFG_DIR/vendor/lineage.config" \
+              "$CFG_DIR/vendor/lineageos.config" \
+              "$CFG_DIR/vendor/${DEVICE}.config"; do
+            [ -f "$frag" ] && MERGE_FRAGS="$MERGE_FRAGS $frag"
+          done
+
+          cat ../build/configs/sukisu.config >> "$CFG_DIR/$DEFCONFIG"
 
           if [ "${{ inputs.enable_lto }}" = "true" ]; then
-            cat ../build/configs/lto.config >> "arch/arm64/configs/$DEFCONFIG"
+            cat ../build/configs/lto.config >> "$CFG_DIR/$DEFCONFIG"
           fi
+
+          echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
+          echo "MERGE_FRAGS=$MERGE_FRAGS" >> $GITHUB_ENV
 
       - name: Build kernel
         working-directory: kernel
@@ -181,6 +208,13 @@ jobs:
           )
 
           make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+          if [ -n "$MERGE_FRAGS" ]; then
+            echo "Merging fragments: $MERGE_FRAGS"
+            ./scripts/kconfig/merge_config.sh -O out -m out/.config $MERGE_FRAGS
+            make "${MAKE_ARGS[@]}" olddefconfig
+          fi
+
           make -j"$(nproc --all)" "${MAKE_ARGS[@]}" 2>&1 | tee build.log
 
       - name: Verify kernel image
