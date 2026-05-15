@@ -1,0 +1,229 @@
+name: Build SM8250 SukiSU-Ultra Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Target device codename"
+        required: true
+        default: "instantnoodle"
+        type: choice
+        options:
+          - instantnoodle      # OnePlus 8
+          - instantnoodlep     # OnePlus 8 Pro
+          - kebab              # OnePlus 8T
+          - lemonadep          # OnePlus 9R (also lemonade variants)
+      kernel_repo:
+        description: "Kernel source repo (must be EvolutionX/LineageOS 22.2 SM8250 tree)"
+        required: true
+        default: "https://github.com/Evolution-X-Devices/kernel_oneplus_sm8250"
+      kernel_branch:
+        description: "Kernel source branch"
+        required: true
+        default: "lineage-22.2"
+      enable_susfs:
+        description: "Enable SUSFS (root hiding)"
+        required: true
+        default: true
+        type: boolean
+      enable_lto:
+        description: "Enable LTO (slower build, smaller/faster kernel)"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Build ${{ inputs.device }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+        with:
+          path: build
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache cpio flex git libelf-dev \
+            libssl-dev lz4 zip zstd python3 python3-pip device-tree-compiler \
+            curl wget rsync unzip gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel-${{ inputs.device }}
+          max-size: 4G
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+            "${{ inputs.kernel_repo }}" kernel
+          cd kernel
+          echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel" >> $GITHUB_ENV
+
+      - name: Clone AOSP clang toolchain
+        run: |
+          mkdir -p toolchain/clang
+          # AOSP clang r487747c — works for 4.19 downstream; pin to a known-good build
+          git clone --depth=1 -b master-kernel-build-2023 \
+            https://gitlab.com/PixelOS-Devices/playgroundtc.git toolchain/clang || \
+          git clone --depth=1 \
+            https://gitlab.com/LeCmnGend/clang.git toolchain/clang
+          echo "CLANG_DIR=$GITHUB_WORKSPACE/toolchain/clang" >> $GITHUB_ENV
+
+      - name: Integrate SukiSU-Ultra
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s susfs-main
+          # Ensure KSU is included in the build
+          if ! grep -q "drivers/kernelsu" drivers/Makefile 2>/dev/null; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          fi
+          if ! grep -q "kernelsu/Kconfig" drivers/Kconfig 2>/dev/null; then
+            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
+
+      - name: Apply SUSFS patches
+        if: ${{ inputs.enable_susfs }}
+        working-directory: kernel
+        run: |
+          git clone --depth=1 -b kernel-4.19 \
+            https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
+
+          # Copy SUSFS sources into kernel tree
+          cp ../susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
+          cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+
+          # Apply 4.19 SUSFS patch
+          if [ -f ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch ]; then
+            patch -p1 --forward --fuzz=3 < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
+          fi
+
+          # Apply SukiSU's bundled SUSFS hook patch
+          if [ -f ../build/patches/susfs_sukisu_hooks.patch ]; then
+            patch -p1 --forward --fuzz=3 < ../build/patches/susfs_sukisu_hooks.patch || true
+          fi
+
+      - name: Apply project patches
+        working-directory: kernel
+        run: |
+          shopt -s nullglob
+          for p in ../build/patches/*.patch; do
+            [ "$(basename "$p")" = "susfs_sukisu_hooks.patch" ] && continue
+            echo "Applying $p"
+            patch -p1 --forward --fuzz=3 < "$p" || true
+          done
+
+      - name: Configure defconfig
+        working-directory: kernel
+        run: |
+          DEVICE="${{ inputs.device }}"
+          # SM8250 OnePlus defconfig naming varies between trees; try common ones
+          for cfg in \
+            "vendor/${DEVICE}_defconfig" \
+            "vendor/kona_defconfig" \
+            "vendor/lineage_${DEVICE}_defconfig"; do
+            if [ -f "arch/arm64/configs/$cfg" ]; then
+              echo "DEFCONFIG=$cfg" >> $GITHUB_ENV
+              break
+            fi
+          done
+
+          if [ -z "$DEFCONFIG" ]; then
+            echo "ERROR: no defconfig found for $DEVICE — check the kernel tree"
+            ls arch/arm64/configs/ | head -50
+            exit 1
+          fi
+
+          # Append our fragment (KSU + SUSFS + Zygisk-friendly options)
+          cat ../build/configs/sukisu.config >> "arch/arm64/configs/$DEFCONFIG"
+
+          if [ "${{ inputs.enable_lto }}" = "true" ]; then
+            cat ../build/configs/lto.config >> "arch/arm64/configs/$DEFCONFIG"
+          fi
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export PATH="$CLANG_DIR/bin:/usr/lib/ccache:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER="github"
+          export KBUILD_BUILD_HOST="actions"
+          export LLVM=1
+          export LLVM_IAS=1
+
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC="ccache clang"
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          )
+
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+          make -j"$(nproc --all)" "${MAKE_ARGS[@]}" 2>&1 | tee build.log
+
+      - name: Verify kernel image
+        working-directory: kernel
+        run: |
+          IMAGE=out/arch/arm64/boot/Image
+          if [ ! -f "$IMAGE" ]; then
+            echo "Build failed — no Image produced"
+            tail -200 build.log
+            exit 1
+          fi
+          ls -lh out/arch/arm64/boot/
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          cp build/anykernel/anykernel.sh ak3/anykernel.sh
+          # Substitute device codename
+          sed -i "s/__DEVICE__/${{ inputs.device }}/g" ak3/anykernel.sh
+
+          cp kernel/out/arch/arm64/boot/Image ak3/ 2>/dev/null || true
+          cp kernel/out/arch/arm64/boot/Image.gz ak3/ 2>/dev/null || true
+          cp kernel/out/arch/arm64/boot/dtb.img ak3/ 2>/dev/null || true
+          cp kernel/out/arch/arm64/boot/dtbo.img ak3/ 2>/dev/null || true
+
+          STAMP=$(date +%Y%m%d-%H%M)
+          ZIP_NAME="SukiSU-${{ inputs.device }}-EvoX-A16-${STAMP}.zip"
+          cd ak3
+          zip -r9 "../$ZIP_NAME" . -x ".git*" "*.md"
+          cd ..
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ inputs.device }}
+          path: kernel/build.log
+          if-no-files-found: ignore
