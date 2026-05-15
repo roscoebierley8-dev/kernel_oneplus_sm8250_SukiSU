@@ -16,11 +16,11 @@ on:
       kernel_repo:
         description: "Kernel source repo URL"
         required: true
-        default: "https://github.com/LineageOS/android_kernel_oneplus_sm8250"
+        default: "https://github.com/Evolution-X-Devices/kernel_oneplus_sm8250"
       kernel_branch:
-        description: "Branch (LineageOS: lineage-23.0=A16, lineage-22.2=A15; EvoX-Devices: bka)"
+        description: "Branch (EvoX-Devices: bka=A16; LineageOS: lineage-23.0=A16, lineage-22.2=A15)"
         required: true
-        default: "lineage-23.0"
+        default: "bka"
       enable_susfs:
         description: "Enable SUSFS (root hiding)"
         required: true
