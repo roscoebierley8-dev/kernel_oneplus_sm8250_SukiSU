@@ -16,11 +16,11 @@ on:
       kernel_repo:
         description: "Kernel source repo URL"
         required: true
-        default: "https://github.com/The-Anomalist/Singularity"
+        default: "https://github.com/ppajda/android_kernel_oneplus_sm8250"
       kernel_branch:
         description: "Branch (EvoX  -Devices: bka=A16; LineageOS: lineage-23.0=A16, lineage-22.2=A15)"
         required: true
-        default: "Evolved"
+        default: "oos13.1"
       enable_susfs:
         description: "Enable SUSFS (root hiding)"
         required: true
